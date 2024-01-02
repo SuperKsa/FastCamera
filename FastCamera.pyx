@@ -4,13 +4,16 @@ Email: cr180@cr180.com
 https://github.com/SuperKsa/FastCamera
 LastUpdate: 2024-01-01 00:00:00
 """
-import collections
+import math
 import platform
 import threading
 import time
 import traceback
 
 import cv2
+import numpy as np
+
+
 
 cdef class FastCamera:
     cdef:
@@ -28,11 +31,18 @@ cdef class FastCamera:
         object callback
         bint stop_threads
         object cap
-        object th
         bint Exit
         int ths_count
         int ExitThread
-        object FrameQueueData
+        int readFPS
+        int read_step_time
+        list thread_task_map
+        list thread_task_status
+        int thread_task_currentID
+        object Frame_Data
+        double Frame_time
+        int Frame_tid
+        object LOCK
 
     def __cinit__(self, int CameraID=0, int width=0, int height=0, bint mjpg=False, int queueNum=0, int buffSize=10, int thread_count=1, object callback=None):
         """
@@ -57,24 +67,39 @@ cdef class FastCamera:
         self.buffSize = buffSize
         self.ths_count = thread_count
         self.cap = None
-        self.FrameQueueData = collections.deque(maxlen=queueNum)
+
+        self.readFPS = 60  # 采集帧率
+        self.read_step_time = math.floor(1000 / self.readFPS) - 10  # 每帧间隔时间
+        self.thread_task_map = []
+        self.thread_task_status = []
+        self.thread_task_currentID = 0  # 当前任务线程ID
+        self.Frame_Data = np.zeros((height, width, 3), dtype=np.uint8)
+        self.Frame_time = 0
+
+        self.LOCK = threading.Lock()
 
 
 
+        # 启动帧回调进程
+        th = threading.Thread(target=self._callFunc)
+        th.daemon = True  #子线程必须和主进程一同退出，防止僵尸进程
+        th.start()
 
         self.start()
 
 
         self.Exit = False
 
+        loopN = 0
         while True:
+            self.read_step_time = math.floor(1000 / self.readFPS) - 10
             if self.Exit:
                 while True:
                     if self.ExitThread == self.ths_count:
                         return
                     time.sleep(0.001)
 
-            elif self.Status == 2:
+            elif self.Status == 1:
                 print('【摄像头重启中】')
                 self.release(False)
                 while self.ExitThread != self.ths_count:
@@ -84,7 +109,25 @@ cdef class FastCamera:
                 self.startTime = time.time()
                 self.FPS_count = 0
 
-            time.sleep(0.01)
+            try:
+                if loopN >= self.read_step_time:
+                    loopN = 0
+                    # 查找空闲线程 并分配任务
+                    for i in range(self.ths_count):
+                        # 空闲线程 status=0 分配任务hash=时间戳
+                        if self.thread_task_status[i] == 0:
+                            self.thread_task_currentID = i
+                            # print(f'分配任务给 {i}')
+                            taskID = time.time()
+                            self.thread_task_map[i] = taskID
+                            break
+            except Exception as e:
+                print('任务分配主进程报错：', e)
+                pass
+            loopN += 1
+
+            time.sleep(0.001)  # 1ms间隔
+
         print('【VideoCapture】进程退出')
         # sys.exit()
 
@@ -99,7 +142,7 @@ cdef class FastCamera:
         self.mjpg = mjpg
 
 
-        self.Status = 2
+        self.Status = 1
 
 
     def start(self):
@@ -107,11 +150,17 @@ cdef class FastCamera:
         self.stop_threads = False  # 当前进程是否停止
         self.Status = 0
 
+        self.thread_task_status = []
+        self.thread_task_map = []
         for i in range(self.ths_count):
+            self.thread_task_status.append(0)  # 标记线程状态为空闲
+            self.thread_task_map.append(0)  # 标记线程任务为空
+
             th = threading.Thread(target=self._reader, args=(i,))
             th.daemon = True  #子线程必须和主进程一同退出，防止僵尸进程
             th.start()
-            time.sleep(0.01)  # 10ms启动一个子线程
+
+
         if platform.system().lower() == 'linux':
             print('=' * 40)
             print(f'= 摄像头初始化中 ID=/dev/video{self.CameraID} ThreadCount={self.ths_count}')
@@ -131,7 +180,7 @@ cdef class FastCamera:
             self.set_size()
 
             self.startTime = time.time()
-            self.Status = 1
+            self.Status = 2
 
             print('= 摄像头初始化完成')
         else:
@@ -158,8 +207,50 @@ cdef class FastCamera:
     def set(self, int key, int value):
         self.cap.set(key, value)
 
-    def addFrame(self, times, frame):
-        self.FrameQueueData.append([times, frame])
+    def addFrame(self, taskID, tid, times, frame):
+        with self.LOCK:
+            # t = time.time()
+            try:
+                shape = frame.shape  # 尝试访问图像的形状 防止报错
+                # if times > self.Frame_time and not np.array_equal(frame, self.Frame_Data):
+                if times > self.Frame_time:
+                    self.Frame_Data = frame
+                    self.Frame_time = times
+                    self.Frame_tid = tid
+                    # print(f'更新帧耗时={round((time.time() - t) * 1000)}ms')
+            except AttributeError as e:
+                print(f"图像不完整1: {e}")
+            except IOError as e:
+                print(f"发生IOError2: {e}")
+            except Exception as e:
+                print(f"发生了其他异常: {e}")
+
+    def _callFunc(self):
+        """
+        帧回调函数 将帧回调给外部调用函数
+        :return:
+        """
+        sendTime = 0.
+        while True:
+            if self.stop_threads:
+                print(f'【FastCamera】 回调进程退出 OutEd')
+                break
+            if sendTime < self.Frame_time:
+                try:
+                    shape = self.Frame_Data.shape
+                    # t = time.time()
+                    self.callback(self, self.Frame_tid, self.Frame_time, self.Frame_Data)
+                    # print(f'推送帧耗时={round((time.time() - t) * 1000)}ms')
+                except AttributeError as e:
+                    print(f"图像不完整: {e}")
+                except IOError as e:
+                    print(f"发生IOError: {e}")
+                except Exception as e:
+                    print('帧回调函数报错：', e)
+                    pass
+                sendTime = self.Frame_time
+            time.sleep(0.001)
+
 
     # 实时读帧，将所有帧保存到队列
     def _reader(self, tid):
@@ -168,61 +259,43 @@ cdef class FastCamera:
             if self.stop_threads:
                 print(f'【FastCamera】 Thread-{tid} OutEd')
                 break
-            try:
-                if self.Status == 2:
-                    time.sleep(1)
-                    continue
-
-                startFrameTime = time.time()
-                frame_time = 0
-
+            # 如果当前存在任务
+            taskID = self.thread_task_map[tid]
+            if taskID > 0 and self.Status >= 2 and self.cap is not None and self.cap.isOpened():
+                self.thread_task_status[tid] = 1  # 标记当前进程为忙碌
                 try:
-                    if self.Status == 1 and self.cap is not None and self.cap.isOpened():
-                        ret, frame = self.cap.read()
-                        self.readTime = (time.time() - startFrameTime)
-                        if ret:
-                            self.Status = 3
-                            frame_time = startFrameTime
-                            self.addFrame(frame_time, frame)
+                    startFrameTime = time.time()
+                    frame_time = 0
+                    ret, frame = self.cap.read()
+                    self.readTime = (time.time() - startFrameTime)
+                    # 读取到画面
+                    if ret:
+                        self.Status = 3
+                        frame_time = startFrameTime
+                        self.addFrame(taskID, tid, frame_time, frame)  # 画面添加到帧
+
+                        # -------- FPS统计处理 Start -------- #
+                        time_x = (time.time() - self.startTime)
+                        self.FPS_count += 1
+                        if time_x > 0:
+                            self.FPS = round(self.FPS_count / time_x, 1)
                         else:
-                            startFrameTime = 0
-                            frame  = None
-                    else:
-                        self.Status = 0
-                        frame = None
-                        self.readTime = 0
+                            self.FPS = 0
+                        if self.FPS_count > 10000:
+                            self.FPS_count = 1
+                            self.startTime = time.time()
+                        # -------- FPS统计处理 End -------- #
+                    self.frameTimes = (time.time() - startFrameTime)
 
                 except Exception as e:
                     traceback.print_exc()
+                    print('帧读取线程报错：', e)
                     pass
-
-                try:
-                    func_res = self.callback(self, frame_time, frame)
-                    # 直接结束进程
-                    if func_res == True:
-                        self.release()
-                        continue
-                except Exception as e:
-                    # traceback.print_exc()
-                    pass
-
-                # -------- FPS统计处理 Start -------- #
-                time_x = (time.time() - self.startTime)
-                self.FPS_count += 1
-                if time_x > 0:
-                    self.FPS = round(self.FPS_count / time_x, 1)
-                else:
-                    self.FPS = 0
-                if self.FPS_count > 10000:
-                    self.FPS_count = 1
-                    self.startTime = time.time()
-                # -------- FPS统计处理 End -------- #
-                self.frameTimes = (time.time() - startFrameTime)
-
-            except Exception as e:
-                traceback.print_exc()
-                pass
+                self.thread_task_status[tid] = 0  # 标记当前进程为 空闲
+                self.thread_task_map[tid] = 0
+                # print(f'tid={tid} 空闲')
             time.sleep(0.001)
+
         self.ExitThread += 1
 
 
@@ -248,7 +321,6 @@ cdef class FastCamera:
         if self.readTime > 0:
             return round(self.readTime * 1000 / self.ths_count)
         return 0
-
 
     def release(self, isExit=True):
         """
