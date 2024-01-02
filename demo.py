@@ -27,13 +27,21 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 # ---------- Config ---------- #
-Width = 1920  # camera Width 分辨率-宽
-Height = 1080  # camera Height  分辨率-高
+Width = 2688  # camera Width 分辨率-宽
+Height = 1520  # camera Height  分辨率-高
 MJPG = True  # is MJPG 你应该启用MJPG
 CameraID = 0  # camera ID  摄像头ID
-buffSize = 0  # opencv buffer
-CapThreadCount = 2  # Number of thread 启用多少个子线程(>2K 60FPS 应该设置2-5)
-QueueNum = 0  # read Queue num  （帧队列 待启用的参数）
+buffSize = 3  # opencv buffer
+CapThreadCount = 4  # Number of thread 启用多少个子线程(>2K 60FPS 应该设置2-5)
+QueueNum = 1000  # read Queue num  （帧队列 待启用的参数）
+
+CameraParam = {
+    'Width' : 2688,  # camera Width 分辨率-宽
+    'Height' : 1520,  # camera Height  分辨率-高
+    'MJPG' : True,  # is MJPG 你应该启用MJPG
+    'CameraID' : 20,  # camera ID  摄像头ID
+    'BuffSize' : 0,  # opencv buffer
+}
 # ---------- Config ---------- #
 
 def callbackFrame(cap:FastCamera, times, frame):
@@ -57,11 +65,14 @@ def callbackFrame(cap:FastCamera, times, frame):
     # 这里仅作为demo例子，实际过程中，你应该在收到frame数据以后立即存入队列中，而不应该在这里进行耗时逻辑！！ #
     # This is only a demo example. In actual implementation, you should immediately store the received frame data in a queue, and avoid time-consuming logic in this context. #
 
-    cv2.imshow("FastCamera Frame",frame)
+    debugString = ''
+    if times > 0:
+        debugString = f'frame={frame.shape}'
+        cv2.imshow("FastCamera Frame", frame)
 
 
     CurrentDate = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S.%f")
-    sys.stdout.write(f'\r[{CurrentDate}] FPS={cap.fps()} FrameTime={cap.read_time()}ms/{cap.fps_time()}ms FrameKey={times} MainExit={MainExit}')
+    sys.stdout.write(f'\r[{CurrentDate}] FPS={cap.fps()} FrameTime={cap.read_time()}ms/{cap.fps_time()}ms FrameKey={times} MainExit={MainExit} {debugString}')
     sys.stdout.flush()
 
     waitKey = cv2.waitKey(1)
